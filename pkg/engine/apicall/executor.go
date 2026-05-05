@@ -150,13 +150,6 @@ func (a *executor) addHTTPHeaders(req *http.Request, headers []kyvernov1.HTTPHea
 	for _, header := range headers {
 		req.Header.Add(header.Key, header.Value)
 	}
-
-	if req.Header.Get("Authorization") == "" {
-		if token, ok := readScopedToken(); ok && token != "" {
-			req.Header.Add("Authorization", "Bearer "+token)
-		}
-	}
-
 	return nil
 }
 

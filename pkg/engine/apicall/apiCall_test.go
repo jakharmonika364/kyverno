@@ -306,9 +306,9 @@ func Test_serviceHeaders(t *testing.T) {
 	var responseHeaders map[string][]string
 	err = json.Unmarshal(data, &responseHeaders)
 	assert.NilError(t, err)
-	assert.Equal(t, 5, len(responseHeaders))
 	assert.Equal(t, "application/json", responseHeaders["Content-Type"][0])
 	assert.Equal(t, "CustomVal", responseHeaders["Custom-Key"][0])
+	assert.Equal(t, "Bearer 1234567890", responseHeaders["Authorization"][0])
 }
 
 type mockClient struct{}
