@@ -8,10 +8,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/go-logr/logr"
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
+	"github.com/kyverno/kyverno/pkg/toggle"
 	"github.com/kyverno/kyverno/pkg/tracing"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -68,9 +72,89 @@ func (a *executor) executeK8sAPICall(ctx context.Context, path string, method ky
 	return jsonData, nil
 }
 
+// validateServiceURL enforces the operator-configured blocklist and allowlist.
+// CIDR blocklist entries are skipped here and checked at dial time by secureDialContext.
+func validateServiceURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid service URL: %w", err)
+	}
+
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+
+	if allowlist := toggle.HTTPAllowlist.Values(); len(allowlist) > 0 {
+		allowed := false
+		for _, entry := range allowlist {
+			if strings.HasPrefix(rawURL, entry) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("URL %q is not permitted: no matching allowlist entry", rawURL)
+		}
+	}
+
+	for _, entry := range toggle.HTTPBlocklist.Values() {
+		if _, _, err := net.ParseCIDR(entry); err == nil {
+			continue
+		}
+		if strings.ToLower(strings.TrimSuffix(entry, ".")) == host {
+			return fmt.Errorf("URL %q is blocked: hostname %q is on the blocklist", rawURL, host)
+		}
+	}
+
+	return nil
+}
+
+// secureDialContext returns a DialContext that checks resolved IPs against CIDR blocklist entries
+// before connecting. Pinning to the resolved IP prevents DNS-rebinding. Returns nil if no CIDR
+// entries are present.
+func secureDialContext(blocklist []string) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	var cidrs []*net.IPNet
+	for _, entry := range blocklist {
+		if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+			cidrs = append(cidrs, ipNet)
+		}
+	}
+	if len(cidrs) == 0 {
+		return nil
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := net.DefaultResolver.LookupHost(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve host %q: %w", host, err)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("no addresses resolved for host %q", host)
+		}
+		for _, ipStr := range ips {
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				continue
+			}
+			for _, cidr := range cidrs {
+				if cidr.Contains(ip) {
+					return nil, fmt.Errorf("host %q resolves to blocked address %s (%s)", host, ip, cidr)
+				}
+			}
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
+	}
+}
+
 func (a *executor) executeServiceCall(ctx context.Context, apiCall *kyvernov1.APICall) ([]byte, error) {
 	if apiCall.Service == nil {
 		return nil, fmt.Errorf("missing service for APICall %s", a.name)
+	}
+
+	if err := validateServiceURL(apiCall.Service.URL); err != nil {
+		return nil, fmt.Errorf("APICall %s: %w", a.name, err)
 	}
 
 	client, err := a.buildHTTPClient(apiCall.Service)
@@ -155,21 +239,24 @@ func (a *executor) addHTTPHeaders(req *http.Request, headers []kyvernov1.HTTPHea
 
 func (a *executor) buildHTTPClient(service *kyvernov1.ServiceCall) (*http.Client, error) {
 	timeout := a.config.GetTimeout()
-	if service == nil || service.CABundle == "" {
-		return &http.Client{
-			Timeout: timeout,
-		}, nil
+	dialCtx := secureDialContext(toggle.HTTPBlocklist.Values())
+
+	transport := &http.Transport{}
+	if dialCtx != nil {
+		transport.DialContext = dialCtx
 	}
-	caCertPool := x509.NewCertPool()
-	if ok := caCertPool.AppendCertsFromPEM([]byte(service.CABundle)); !ok {
-		return nil, fmt.Errorf("failed to parse PEM CA bundle for APICall %s", a.name)
-	}
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
+
+	if service != nil && service.CABundle != "" {
+		caCertPool := x509.NewCertPool()
+		if ok := caCertPool.AppendCertsFromPEM([]byte(service.CABundle)); !ok {
+			return nil, fmt.Errorf("failed to parse PEM CA bundle for APICall %s", a.name)
+		}
+		transport.TLSClientConfig = &tls.Config{
 			RootCAs:    caCertPool,
 			MinVersion: tls.VersionTLS12,
-		},
+		}
 	}
+
 	return &http.Client{
 		Transport: tracing.Transport(transport, otelhttp.WithFilter(tracing.RequestFilterIsInSpan)),
 		Timeout:   timeout,

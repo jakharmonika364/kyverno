@@ -14,6 +14,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/config"
 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
+	"github.com/kyverno/kyverno/pkg/toggle"
 	"gotest.tools/assert"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
@@ -80,6 +81,9 @@ func buildTestServer(responseData []byte, useChunked bool) *httptest.Server {
 
 func Test_serviceGetRequest(t *testing.T) {
 	testfn := func(t *testing.T, useChunked bool) {
+		assert.NilError(t, toggle.HTTPBlocklist.Parse(""))
+		t.Cleanup(func() { toggle.HTTPBlocklist.Reset() })
+
 		serverResponse := []byte(`{ "day": "Sunday" }`)
 		s := buildTestServer(serverResponse, useChunked)
 		defer s.Close()
@@ -141,6 +145,9 @@ func Test_serviceGetRequest(t *testing.T) {
 }
 
 func Test_servicePostRequest(t *testing.T) {
+	assert.NilError(t, toggle.HTTPBlocklist.Parse(""))
+	t.Cleanup(func() { toggle.HTTPBlocklist.Reset() })
+
 	serverResponse := []byte(`{ "day": "Monday" }`)
 	s := buildTestServer(serverResponse, false)
 	defer s.Close()
@@ -275,6 +282,9 @@ func buildEchoHeaderTestServer() *httptest.Server {
 }
 
 func Test_serviceHeaders(t *testing.T) {
+	assert.NilError(t, toggle.HTTPBlocklist.Parse(""))
+	t.Cleanup(func() { toggle.HTTPBlocklist.Reset() })
+
 	s := buildEchoHeaderTestServer()
 	defer s.Close()
 
@@ -396,6 +406,9 @@ func Test_CrossNamespaceAccess_WithVariableSubstitution(t *testing.T) {
 }
 
 func Test_contextCancellation(t *testing.T) {
+	assert.NilError(t, toggle.HTTPBlocklist.Parse(""))
+	t.Cleanup(func() { toggle.HTTPBlocklist.Reset() })
+
 	// Server that delays response longer than our context timeout
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(5 * time.Second)
